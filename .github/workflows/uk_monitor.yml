@@ -1,0 +1,73 @@
+# .github/workflows/uk_monitor.yml
+name: uk_monitor
+
+on:
+  # Listen ONLY for the UK-specific event
+  repository_dispatch:
+    types: [uk_child_completed]
+
+jobs:
+  check_and_retry:
+    runs-on: ubuntu-latest
+    
+    # Needs write access to dispatch the next workflow run
+    permissions:
+      contents: read
+      actions: write 
+
+    steps:
+      # CRITICAL: Must checkout code for 'gh workflow run' to work
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        
+      - name: Install JQ
+        run: sudo apt-get update && sudo apt-get install jq -y
+
+      - name: Extract Inputs
+        id: extract_inputs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Safely parse the raw JSON payload
+          PAYLOAD_JSON=$(echo '${{ toJSON(github.event.client_payload) }}' | jq -c '.')
+          
+          CONCLUSION=$(echo "$PAYLOAD_JSON" | jq -r '.conclusion')
+          LOOP_COUNT=$(echo "$PAYLOAD_JSON" | jq -r '.loop_count')
+          CHILD_NAME=$(echo "$PAYLOAD_JSON" | jq -r '.child_name')
+
+          echo "::notice title=Monitor Triggered::Child: $CHILD_NAME, Status: $CONCLUSION, Loop: $LOOP_COUNT"
+          
+          echo "conclusion=$CONCLUSION" >> $GITHUB_OUTPUT
+          echo "current_loop=$LOOP_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Handle Retry, Manual Stop, or Success
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          CONCLUSION=${{ steps.extract_inputs.outputs.conclusion }}
+          CURRENT_LOOP=${{ steps.extract_inputs.outputs.current_loop }}
+          
+          ORCHESTRATOR_FILENAME="uk_orchestrator.yml"
+          NEXT_LOOP=$((CURRENT_LOOP + 1))
+          
+          if [ "$CONCLUSION" == "success" ]; then
+              echo "Child succeeded on loop $CURRENT_LOOP. Sending final success signal (loop_count=0)."
+              # Dispatch the orchestrator with loop_count=0 to trigger the final notification
+              gh workflow run "$ORCHESTRATOR_FILENAME" \
+                --ref ${{ github.ref_name }} \
+                -f loop_count=0
+                
+          elif [ "$CONCLUSION" == "cancelled" ]; then
+              echo "::notice title=MANUAL STOP TRIGGERED::Child workflow was manually cancelled. Stopping orchestration loop gracefully (loop_count=0)."
+              # If cancelled, treat it as a deliberate stop and send the final success signal (loop_count=0)
+              gh workflow run "$ORCHESTRATOR_FILENAME" \
+                --ref ${{ github.ref_name }} \
+                -f loop_count=0
+                
+          else # This handles "failure" (the normal retry case)
+              echo "Child failed on loop $CURRENT_LOOP. Retrying with loop $NEXT_LOOP."
+              # Dispatch the orchestrator with the next loop count
+              gh workflow run "$ORCHESTRATOR_FILENAME" \
+                --ref ${{ github.ref_name }} \
+                -f loop_count=$NEXT_LOOP
+          fi
