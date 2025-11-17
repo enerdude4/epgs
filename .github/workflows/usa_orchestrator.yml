@@ -1,0 +1,103 @@
+# .github/workflows/usa_orchestrator.yml
+name: usa_orchestrator
+
+on:
+  # Scheduled to run Thurs-Sat at 23:00 UTC
+  schedule:
+    - cron: '0 23 * * 4-6'
+  workflow_dispatch:
+    inputs:
+      loop_count:
+        description: 'Current loop iteration (Internal: 1-20 or 0 for success)'
+        required: false
+        type: number
+
+jobs:
+  dispatch_or_report:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        
+      # CRITICAL FIX: Safely initialize LOOP_COUNT to 1 if it is null (first manual run or scheduled run)
+      - name: Initialize Loop Count
+        id: init_count
+        run: |
+          # Use '1' if the input is null or empty string (happens on first manual or scheduled trigger)
+          INITIAL_INPUT=${{ github.event.inputs.loop_count }}
+          LOOP_COUNT=${INITIAL_INPUT:-1} 
+          echo "Initialized LOOP_COUNT to $LOOP_COUNT"
+          echo "loop_count=$LOOP_COUNT" >> $GITHUB_OUTPUT
+
+      - name: Final Success Notification
+        if: ${{ steps.init_count.outputs.loop_count == 0 }}
+        run: |
+          echo "::notice title=USA EPG ORCHESTRATION COMPLETE::The EPG process completed successfully on a previous loop."
+          exit 0
+
+      - name: Check Loop Limit and Dispatch Child
+        id: loop_check
+        # The condition now checks the safe, initialized value
+        if: ${{ steps.init_count.outputs.loop_count != 0 }}
+        run: |
+          MAX_LOOPS=20
+          LOOP_COUNT=${{ steps.init_count.outputs.loop_count }}
+          
+          if [ "${LOOP_COUNT}" -gt ${MAX_LOOPS} ]; then
+              # Calculate the last valid attempt number (e.g., 21 - 1 = 20)
+              LAST_ATTEMPT=$((LOOP_COUNT - 1))
+              
+              echo "::error title=USA EPG FINAL FAILURE::Maximum of ${MAX_LOOPS} attempts reached. Setting final_failure=true."
+              echo "final_failure=true" >> $GITHUB_OUTPUT # Set output for email step
+              # CRITICAL FIX: Set the pre-calculated value as a new output
+              echo "last_attempt=$LAST_ATTEMPT" >> $GITHUB_OUTPUT
+          else
+              echo "Starting EPG job dispatch loop ${LOOP_COUNT} of ${MAX_LOOPS}"
+              echo "final_failure=false" >> $GITHUB_OUTPUT # Set output to prevent email
+              
+              # Dispatching the child workflow using the simple file name
+              gh workflow run "usa_child.yml" \
+                --ref ${{ github.ref_name }} \
+                -f loop_count=${LOOP_COUNT}
+              
+              echo "Child dispatched. Orchestrator exiting (Non-blocking)."
+          fi
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Send Max Loops Failure Email
+        # CRITICAL: Only runs if the check step determined max loops were reached
+        if: ${{ steps.loop_check.outputs.final_failure == 'true' }}
+        uses: dawidd6/action-send-mail@v3
+        with:
+          # --- Hardcoded Mail Configuration (using new parameter names) ---
+          server_address: 'smtp.gmail.com'
+          server_port: 465
+          # --- Secrets Retained for Authentication ---
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          # --- Hardcoded Recipient ---
+          to: 'hjvanwyk007@gmail.com'
+          from: 'GitHub Actions <no-reply@github.com>'
+          # CRITICAL FIX: Referencing the pre-calculated output
+          subject: '[USA EPG FINAL FAILURE] Retries Exceeded (Loop ${{ steps.loop_check.outputs.last_attempt }})'
+          body: |
+            The USA EPG orchestration process failed after reaching the maximum limit of ${{ steps.loop_check.outputs.last_attempt }} retries. 
+            
+            - Last attempted loop: ${{ steps.loop_check.outputs.last_attempt }}
+            - Workflow Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            
+            Check the workflow logs for details on the persistent failure.
+            
+      - name: Fail Job if Max Loops Reached
+        # CRITICAL: This step ensures the entire Orchestrator job ends in a failure status.
+        if: ${{ steps.loop_check.outputs.final_failure == 'true' }}
+        run: |
+          echo "Final failure detected. Exiting with error."
+          exit 1
