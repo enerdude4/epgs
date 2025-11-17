@@ -1,0 +1,155 @@
+# .github/workflows/uk_child.yml
+name: uk_child # CRITICAL FIX: Use the simple name expected by the Orchestrator
+
+on:
+  workflow_dispatch:
+    inputs:
+      loop_count:
+        description: 'Current loop iteration'
+        required: true
+        type: number
+        default: 1
+
+jobs:
+  generate-epg:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write # CRITICAL FIX: Must be 'write' to call the repository_dispatch API
+      actions: write
+    
+    env:
+      DISPLAY: :99
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }} # Ensure GH_TOKEN is available for the final step
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Setup Chrome
+        uses: browser-actions/setup-chrome@latest
+        with:
+          chrome-version: 'stable' 
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install Dependencies (Including gh CLI and jq)
+        run: |
+          sudo apt-get update
+          sudo sed -i 's/man-db\/auto-update/#man-db\/auto-update/g' /etc/manpath.config
+          sudo rm -f /var/lib/man-db/auto-update
+          # CRITICAL ADDITION: Install the 'gh' CLI for repository_dispatch
+          sudo apt-get install -y xvfb dbus-x11 jq gh 
+          pip install -U requests beautifulsoup4 xmltodict urllib3 undetected-chromedriver selenium
+
+      - name: Start Virtual Display (Xvfb)
+        run: |
+          Xvfb :99 -ac -screen 0 1920x1080x24 &
+          sleep 3 
+
+      - name: Run EPG script
+        id: run_script
+        # This step's exit code determines the job status, unless overridden by the ban flag check.
+        run: python tvepg.eu17.2.py
+        
+      - name: Check for Ban Flag and Force Failure
+        # This step must run always to check for ban_flag.txt created by the script.
+        if: always()
+        id: check_ban
+        run: |
+          if [ -f ban_flag.txt ]; then
+            echo "::error::Ban flag found on loop ${{ github.event.inputs.loop_count }}. Forcing job failure to signal Orchestrator retry."
+            # CRITICAL: Forces the job to fail if the ban flag is detected.
+            # We use an explicit output to signal the failure state later, as `exit 1` here
+            # will prematurely fail the job before the dispatch step can run.
+            echo "BAN_DETECTED=true" >> $GITHUB_ENV
+          else
+            echo "No ban flag found. Allowing script status to finalize."
+            echo "BAN_DETECTED=false" >> $GITHUB_ENV
+          fi
+
+      # --- Conditional Dropbox Upload Steps (Only runs if the job is SUCCESSFUL) ---
+      # IMPORTANT: We only run these if the previous run_script step was successful AND the ban check didn't flag a ban.
+      
+      - name: Refresh Dropbox Access Token
+        # Condition: The overall job must be successful AND no ban flag detected
+        if: success() && env.BAN_DETECTED == 'false'
+        id: get_token
+        env:
+          DROPBOX_APP_KEY: ${{ secrets.DROPBOX_APP_KEY }}
+          DROPBOX_APP_SECRET: ${{ secrets.DROPBOX_APP_SECRET }}
+          DROPBOX_REFRESH_TOKEN: ${{ secrets.DROPBOX_REFRESH_TOKEN }}
+        run: |
+          response=$(curl -s -X POST https://api.dropbox.com/oauth2/token \
+            -u "${DROPBOX_APP_KEY}:${DROPBOX_APP_SECRET}" \
+            -d grant_type=refresh_token \
+            -d refresh_token=${DROPBOX_REFRESH_TOKEN})
+          access_token=$(echo "$response" | jq -r '.access_token')
+          echo "::add-mask::$access_token"
+          echo "access_token=$access_token" >> $GITHUB_OUTPUT
+
+      - name: Upload file to Dropbox
+        if: success() && env.BAN_DETECTED == 'false'
+        run: |
+          curl -X POST \
+            https://content.dropboxapi.com/2/files/upload \
+            -H "Authorization: Bearer ${{ steps.get_token.outputs.access_token }}" \
+            -H "Content-Type: application/octet-stream" \
+            -H "Dropbox-API-Arg: {\"path\": \"/epguk.xml\",\"mode\": \"overwrite\",\"autorename\": false,\"mute\": false}" \
+            --data-binary @./epguk.xml
+
+      - name: Get or Create Shared Link
+        if: success() && env.BAN_DETECTED == 'false'
+        id: get_link
+        run: |
+          existing=$(curl -s -X POST https://api.dropboxapi.com/2/sharing/list_shared_links \
+            -H "Authorization: Bearer ${{ steps.get_token.outputs.access_token }}" \
+            -H "Content-Type: application/json" \
+            -d '{"path": "/epguk.xml", "direct_only": true}')
+
+          url=$(echo "$existing" | jq -r '.links[0].url')
+
+          if [ "$url" == "null" ]; then
+            echo "No shared link found, creating a new one..."
+            response=$(curl -s -X POST https://api.dropboxapi.com/2/sharing/create_shared_link_with_settings \
+              -H "Authorization: Bearer ${{ steps.get_token.outputs.access_token }}" \
+              -H "Content-Type: application/json" \
+              -d '{"path": "/epguk.xml", "settings": {"requested_visibility": "public"}}')
+            url=$(echo "$response" | jq -r '.url')
+          else
+            echo "Reusing existing shared link."
+          fi
+
+          echo "Shared Link: $url"
+          echo "shared_url=$url" >> $GITHUB_OUTPUT
+
+      - name: Send Completion Signal (repository_dispatch)
+        # This final step MUST run regardless of success or failure to send the signal back to the Monitor
+        if: always()
+        run: |
+          LOOP_COUNT=${{ github.event.inputs.loop_count }}
+          
+          # Check for explicit ban detection OR standard job failure
+          if [ "${{ job.status }}" == "success" ] && [ "${{ env.BAN_DETECTED }}" == "false" ]; then
+              JOB_STATUS="success"
+          else
+              # If the script failed, OR if the ban flag was found, it's a failure requiring a retry
+              JOB_STATUS="failure"
+          fi
+          
+          echo "Final signal status: ${JOB_STATUS}"
+
+          # CRITICAL FIX: Use JQ to construct the JSON and pipe it to gh api.
+          jq -n \
+            --arg conclusion "$JOB_STATUS" \
+            --arg loop_count "$LOOP_COUNT" \
+            --arg child_name "uk_child" \
+            '{event_type: "uk_child_completed", client_payload: {conclusion: $conclusion, loop_count: $loop_count, child_name: $child_name}}' \
+          | gh api \
+            --method POST \
+            -H "Accept: application/vnd.github.v3+json" \
+            /repos/:owner/:repo/dispatches \
+            --input -
