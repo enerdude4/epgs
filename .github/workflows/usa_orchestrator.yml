@@ -3,8 +3,8 @@ name: usa_orchestrator
 
 on:
   # Scheduled to run Thurs-Sat at 23:00 UTC
-  schedule:
-    - cron: '0 23 * * 4-6'
+  #schedule:
+  #  - cron: '0 23 * * 4-6'
   workflow_dispatch:
     inputs:
       loop_count:
