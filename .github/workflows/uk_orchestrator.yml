@@ -3,8 +3,8 @@ name: uk_orchestrator
 
 on:
   # Scheduled to run Thurs-Sat at 21:00 UTC
-  schedule:
-    - cron: '0 21 * * 4-6'
+  #schedule:
+  #  - cron: '0 21 * * 4-6'
   workflow_dispatch:
     inputs:
       # CRITICAL: This input is passed by the Monitor (uk_monitor.yml)
